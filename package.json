@@ -1,0 +1,33 @@
+{
+  "name": "claudesave",
+  "version": "1.0.0",
+  "description": "Claude Code proxy with smart routing, prompt caching and session memory",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "ts-node src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "package:win": "pkg dist/index.js --target node18-win-x64 --output bin/claudesave-win.exe",
+    "package:mac": "pkg dist/index.js --target node18-macos-x64 --output bin/claudesave-mac",
+    "package:linux": "pkg dist/index.js --target node18-linux-x64 --output bin/claudesave-linux"
+  },
+  "dependencies": {
+    "@types/node-forge": "^1.3.14",
+    "axios": "^1.6.0",
+    "express": "^4.18.2",
+    "ioredis": "^5.3.2",
+    "js-yaml": "^4.1.0",
+    "node-cache": "^5.1.2",
+    "node-forge": "^1.4.0",
+    "uuid": "^9.0.0"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/js-yaml": "^4.0.9",
+    "@types/node": "^20.11.0",
+    "@types/uuid": "^9.0.7",
+    "pkg": "^5.8.1",
+    "ts-node": "^10.9.2",
+    "typescript": "^5.3.3"
+  }
+}
