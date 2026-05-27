@@ -221,19 +221,41 @@ async function handleStreaming(
   res.status(resp.status);
 
   let inputTokens = 0, outputTokens = 0, cachedTokens = 0;
+  let sseBuffer = "";
 
   resp.data.on("data", (chunk: Buffer) => {
     const text = chunk.toString();
-    res.write(text);
+    res.write(text); // repassa imediatamente pro client
 
-    const match = text.match(/"usage":\s*(\{[^}]+\})/);
-    if (match) {
+    // Parse SSE buffer linha-a-linha pra capturar usage corretamente
+    sseBuffer += text;
+    const lines = sseBuffer.split("\n");
+    sseBuffer = lines.pop() ?? "";
+
+    for (const line of lines) {
+      if (!line.startsWith("data:")) continue;
+      const payload = line.slice(5).trim();
+      if (!payload || payload === "[DONE]") continue;
+
       try {
-        const usage = JSON.parse(match[1]);
-        if (usage.input_tokens)            inputTokens  = usage.input_tokens;
-        if (usage.output_tokens)           outputTokens = usage.output_tokens;
-        if (usage.cache_read_input_tokens) cachedTokens = usage.cache_read_input_tokens;
-      } catch { /* ignore malformed */ }
+        const event = JSON.parse(payload);
+
+        // message_start: vem com input_tokens e output_tokens inicial
+        if (event.type === "message_start" && event.message?.usage) {
+          const u = event.message.usage;
+          if (u.input_tokens)            inputTokens  = u.input_tokens;
+          if (u.output_tokens)           outputTokens = u.output_tokens;
+          if (u.cache_read_input_tokens) cachedTokens = u.cache_read_input_tokens;
+        }
+
+        // message_delta: vem com output_tokens final
+        if (event.type === "message_delta" && event.usage) {
+          const u = event.usage;
+          if (u.input_tokens)            inputTokens  = u.input_tokens;
+          if (u.output_tokens)           outputTokens = u.output_tokens;
+          if (u.cache_read_input_tokens) cachedTokens = u.cache_read_input_tokens;
+        }
+      } catch { /* JSON incompleto entre chunks, ignora */ }
     }
   });
 
