@@ -59,9 +59,11 @@ export function createProxyHandler(config: Config) {
     // 2.5 SMART CODE COMPRESSION (codesight-inspired) — comprime function bodies
     const { request: codeCompressedBody, stats: codeStats } = compressCode(compressedBody, config);
 
-    // 3. Smart routing — escolhe modelo pela complexidade
+    // 3. Smart routing — escolhe modelo pela complexidade (só se habilitado)
     const complexity = classifyComplexity(codeCompressedBody);
-    const routedModel = selectModel(complexity, config);
+    const routedModel = config.routing.enabled
+      ? selectModel(complexity, config)
+      : body.model;
     const routedBody: AnthropicRequest = { ...codeCompressedBody, model: routedModel };
 
     // 4. OUTPUT COMPRESSION (Caveman) — instrui modelo a responder compacto
@@ -196,9 +198,22 @@ async function handleStreaming(
     {
       headers: { ...forwardHeaders(req.headers as Record<string, string>), "accept": "text/event-stream" },
       responseType: "stream",
+      validateStatus: () => true,
       ...extra,
     }
   );
+
+  // Se erro HTTP, lê o body do stream e retorna JSON legível
+  if (resp.status >= 400) {
+    const errorBody = await new Promise<string>((resolve) => {
+      let data = "";
+      resp.data.on("data", (chunk: Buffer) => { data += chunk.toString(); });
+      resp.data.on("end", () => resolve(data));
+    });
+    try { res.status(resp.status).json(JSON.parse(errorBody)); }
+    catch { res.status(resp.status).send(errorBody); }
+    return;
+  }
 
   res.setHeader("Content-Type", "text/event-stream");
   res.setHeader("Cache-Control", "no-cache");
