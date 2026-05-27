@@ -5,7 +5,7 @@ import { Config, AnthropicRequest, RequestStats } from "./types";
 import { classifyComplexity, selectModel, calcCost, getPricing } from "./router";
 import { injectPromptCache } from "./promptCache";
 import { hashRequest, getCached, setCached } from "./cache";
-import { getSession, saveSession, extractSessionId } from "./session";
+import { saveSession, extractSessionId } from "./session";
 import { compressInput } from "./inputCompress";
 import { compressCode } from "./codeCompress";
 import { injectOutputCompression } from "./outputCompress";
@@ -98,7 +98,6 @@ export function createProxyHandler(config: Config) {
 
     // 7. Encaminha para a API Anthropic
     try {
-      const totalSavedFromCompress = inputStats.tokens_saved + codeStats.tokens_saved;
       if (body.stream) {
         await handleStreaming(req, res, finalBody, config, originalModel, routedModel, inputStats.tokens_saved, codeStats.tokens_saved, start);
       } else {

@@ -10,7 +10,7 @@ const DEFAULTS: Config = {
     enabled: true,
     cost_threshold: 0.3,
     models: {
-      simple: "claude-haiku-3-5-20241022",
+      simple: "claude-3-5-haiku-20241022",
       standard: "claude-sonnet-4-5",
       complex: "claude-opus-4-5",
     },

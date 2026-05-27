@@ -58,7 +58,8 @@ export function getSummary(days = 7): {
   const total_original_cost = rows.reduce((s, r) => s + r.original_cost_usd, 0);
   const total_actual_cost   = rows.reduce((s, r) => s + r.actual_cost_usd, 0);
   const total_savings       = rows.reduce((s, r) => s + r.savings_usd, 0);
-  const avg_savings_pct     = rows.length > 0 ? rows.reduce((s, r) => s + r.savings_pct, 0) / rows.length : 0;
+  // % real = economia total / custo original total (não média de percentuais por request)
+  const avg_savings_pct     = total_original_cost > 0 ? Math.min(100, (total_savings / total_original_cost) * 100) : 0;
   const cache_hits          = rows.filter((r) => r.cache_hit).length;
 
   const total_input_tokens        = rows.reduce((s, r) => s + r.input_tokens, 0);

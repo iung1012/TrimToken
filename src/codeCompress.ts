@@ -100,8 +100,6 @@ function compressJsTs(body: string, minLines: number): { body: string; saved: nu
 
       if (innerLines >= minLines) {
         // Comprime: mantém assinatura + comentário + fecha
-        const closeLine = lines[bodyEnd - 1] ?? `${indent}}`;
-        const closeIndent = (closeLine.match(/^\s*/)?.[0]) ?? indent;
         out.push(`${signature} /* ${innerLines} lines */ }`);
         // pula linhas internas + linha de fechamento
       } else {
