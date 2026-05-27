@@ -1,19 +1,19 @@
-# ClaudeSave — HTTPS Interception Mode Installer
+# ClaudeSave - HTTPS Interception Mode Installer
 #
-# AVISO: este modo modifica configurações do sistema:
+# AVISO: este modo modifica configuracoes do sistema:
 #   1. Adiciona "127.0.0.1 api.anthropic.com" ao hosts file
 #   2. Instala um Root CA local no trust store do Windows
 #   3. Habilita https_mode no config do ClaudeSave
 #
-# Isso afeta TODOS os apps que falam com api.anthropic.com nesta máquina.
+# Isso afeta TODOS os apps que falam com api.anthropic.com nesta maquina.
 # Use uninstall-https.ps1 para reverter.
 
 #Requires -RunAsAdministrator
 $ErrorActionPreference = "Stop"
 
 Write-Host ""
-Write-Host "ClaudeSave — HTTPS Mode Setup" -ForegroundColor Cyan
-Write-Host "==============================" -ForegroundColor Cyan
+Write-Host "ClaudeSave - HTTPS Mode Setup" -ForegroundColor Cyan
+Write-Host "=============================" -ForegroundColor Cyan
 Write-Host ""
 
 $installDir = "$env:USERPROFILE\.claudesave"
@@ -22,12 +22,12 @@ $projectDir = Split-Path -Parent $PSCommandPath
 
 # 1. Verifica build
 if (-not (Test-Path "$projectDir\dist\index.js")) {
-    Write-Host "[X] Build não encontrado. Rode 'npm run build' primeiro." -ForegroundColor Red
+    Write-Host "[X] Build nao encontrado. Rode npm run build primeiro." -ForegroundColor Red
     exit 1
 }
 Write-Host "[OK] Build OK"
 
-# 2. Gera certs (chama o módulo TS uma vez)
+# 2. Gera certs (chama o modulo TS uma vez)
 Write-Host "[..] Gerando certificados (uma vez)..."
 Push-Location $projectDir
 $null = node -e "require('./dist/certs').ensureCerts('api.anthropic.com'); console.log('OK')"
@@ -101,6 +101,7 @@ try {
     Write-Host ""
     Write-Host "Para reverter tudo: uninstall-https.ps1" -ForegroundColor Gray
 } catch {
-    Write-Host "[!] Proxy não respondeu. Verifique o log:" -ForegroundColor Yellow
-    Write-Host "    Get-Content $projectDir\claudesave.log -Tail 20"
+    Write-Host "[!] Proxy nao respondeu. Verifique o log:" -ForegroundColor Yellow
+    $logPath = "$projectDir\claudesave.log"
+    Write-Host "    Get-Content $logPath -Tail 20"
 }
