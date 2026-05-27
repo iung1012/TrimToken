@@ -246,7 +246,7 @@ async function handleStreaming(
 
 function forwardHeaders(headers: Record<string, string | string[] | undefined>): Record<string, string> {
   const result: Record<string, string> = {};
-  const allowed = ["x-api-key", "anthropic-version", "content-type", "anthropic-beta"];
+  const allowed = ["x-api-key", "anthropic-version", "content-type", "anthropic-beta", "authorization"];
   for (const key of allowed) {
     const val = headers[key];
     if (val) result[key] = Array.isArray(val) ? val[0] : val;

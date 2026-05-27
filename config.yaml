@@ -1,8 +1,8 @@
-port: 8019
+﻿port: 8019
 anthropic_api_url: "https://api.anthropic.com"
 
-# ─── ROUTING INTELIGENTE ──────────────────────────────────────────
-# Roteia automaticamente para o modelo mais barato adequado à tarefa.
+# â”€â”€â”€ ROUTING INTELIGENTE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Roteia automaticamente para o modelo mais barato adequado Ã  tarefa.
 # Funciona com API key (economia em $$) e com plano Pro/Max (economia de cota).
 routing:
   enabled: true
@@ -12,66 +12,67 @@ routing:
     standard: "claude-sonnet-4-5"
     complex: "claude-opus-4-5"
 
-# ─── PROMPT CACHE NATIVO (cache_control) ──────────────────────────
+# â”€â”€â”€ PROMPT CACHE NATIVO (cache_control) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Injeta cache_control nos pontos certos para que a Anthropic cobre
 # apenas 10% dos tokens repetidos. Funciona via API key.
 prompt_cache:
   enabled: true
   min_tokens_to_cache: 1024
 
-# ─── SESSION MEMORY ───────────────────────────────────────────────
-# Mantém contexto de conversa entre requisições, evitando reenvio.
+# â”€â”€â”€ SESSION MEMORY â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# MantÃ©m contexto de conversa entre requisiÃ§Ãµes, evitando reenvio.
 session_memory:
   enabled: true
   ttl_seconds: 7200  # 2 horas
 
-# ─── RESPONSE CACHE ───────────────────────────────────────────────
-# Cacheia respostas inteiras. Pergunta idêntica = resposta instantânea
+# â”€â”€â”€ RESPONSE CACHE â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Cacheia respostas inteiras. Pergunta idÃªntica = resposta instantÃ¢nea
 # sem gastar nenhum token. Funciona em qualquer plano.
 response_cache:
   enabled: true
   ttl_seconds: 3600
-  redis_url: ""  # vazio = cache em memória
+  redis_url: ""  # vazio = cache em memÃ³ria
 
-# ─── OUTPUT COMPRESSION (Caveman) ─────────────────────────────────
-# Injeta instruções no system prompt para que o Claude responda de
+# â”€â”€â”€ OUTPUT COMPRESSION (Caveman) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Injeta instruÃ§Ãµes no system prompt para que o Claude responda de
 # forma mais compacta. Reduz output em 40-70%. Funciona em qualquer plano.
-# Níveis: off | light | medium | aggressive
+# NÃ­veis: off | light | medium | aggressive
 output_compress:
   enabled: true
   level: "medium"
 
-# ─── INPUT COMPRESSION (RTK-style) ────────────────────────────────
+# â”€â”€â”€ INPUT COMPRESSION (RTK-style) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 # Comprime mensagens enviadas removendo whitespace redundante,
-# deduplicando linhas e truncando outputs longos. Preserva código.
+# deduplicando linhas e truncando outputs longos. Preserva cÃ³digo.
 # Reduz input em 30-70%. Funciona em qualquer plano.
 input_compress:
   enabled: true
   level: "medium"
   preserve_last_message: true  # nunca comprime o que o user acabou de pedir
 
-# ─── SMART CODE COMPRESSION (codesight-inspired) ──────────────────
-# Detecta blocos de código nas mensagens e comprime function bodies
+# â”€â”€â”€ SMART CODE COMPRESSION (codesight-inspired) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# Detecta blocos de cÃ³digo nas mensagens e comprime function bodies
 # em assinaturas, mantendo imports/types/exports.
-# Reduz 30-90% em prompts com código bruto. Funciona em qualquer plano.
+# Reduz 30-90% em prompts com cÃ³digo bruto. Funciona em qualquer plano.
 # Suporta: TypeScript, JavaScript, Python, Go, Java, Rust.
-# Níveis: light (>30 linhas) | medium (>15 linhas) | aggressive (>8 linhas)
+# NÃ­veis: light (>30 linhas) | medium (>15 linhas) | aggressive (>8 linhas)
 code_compress:
   enabled: true
   level: "medium"
   preserve_last_message: true
 
-# ─── DASHBOARD ────────────────────────────────────────────────────
+# â”€â”€â”€ DASHBOARD â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
 dashboard:
   enabled: true
   port: 8019
   path: "/dashboard"
 
-# ─── HTTPS MODE (intercepta Claude Desktop App) ───────────────────
-# ATENÇÃO: requer admin, modifica hosts file e instala cert no trust store.
+# â”€â”€â”€ HTTPS MODE (intercepta Claude Desktop App) â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€â”€
+# ATENÃ‡ÃƒO: requer admin, modifica hosts file e instala cert no trust store.
 # Use install-https.ps1 (como Administrador) pra configurar.
-# Quando ativo, intercepta TODO o tráfego de api.anthropic.com da sua máquina.
+# Quando ativo, intercepta TODO o trÃ¡fego de api.anthropic.com da sua mÃ¡quina.
 https_mode:
-  enabled: false           # ative APÓS rodar install-https.ps1
+  enabled: false
   port: 443
   hostname: "api.anthropic.com"
+
