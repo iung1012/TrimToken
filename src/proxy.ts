@@ -59,10 +59,12 @@ export function createProxyHandler(config: Config) {
     // 2.5 SMART CODE COMPRESSION (codesight-inspired) — comprime function bodies
     const { request: codeCompressedBody, stats: codeStats } = compressCode(compressedBody, config);
 
-    // 3. Smart routing — escolhe modelo pela complexidade (só se habilitado)
+    // 3. Smart routing — só faz downgrade para Haiku em tarefas simples.
+    // Para standard/complex, preserva o modelo escolhido pelo Claude Code
+    // (evita erro 404 por nome de modelo desconhecido).
     const complexity = classifyComplexity(codeCompressedBody);
-    const routedModel = config.routing.enabled
-      ? selectModel(complexity, config)
+    const routedModel = (config.routing.enabled && complexity === "simple")
+      ? config.routing.models.simple
       : body.model;
     const routedBody: AnthropicRequest = { ...codeCompressedBody, model: routedModel };
 

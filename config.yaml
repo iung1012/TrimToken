@@ -5,7 +5,7 @@ anthropic_api_url: "https://api.anthropic.com"
 # Roteia automaticamente para o modelo mais barato adequado Ã  tarefa.
 # Funciona com API key (economia em $$) e com plano Pro/Max (economia de cota).
 routing:
-  enabled: false
+  enabled: true
   cost_threshold: 0.3
   models:
     simple: "claude-3-5-haiku-20241022"
