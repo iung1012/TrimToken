@@ -132,15 +132,17 @@ async function handleNormal(
   const outputTokens = data.usage?.output_tokens ?? 0;
   const cachedTokens = data.usage?.cache_read_input_tokens ?? 0;
 
-  // Custo "original" = se nada tivesse sido otimizado (modelo original + tokens não comprimidos)
+  // Custo "original" = sem otimizacoes do TrimToken, mas preservando cache nativo
+  // do Claude Code (que acontece independente do proxy). So creditamos savings
+  // reais do TrimToken (compressao + roteamento + estimativa de output).
   const origInput  = inputTokens + inputTokensSaved + codeTokensSaved;
   const outputSaveEst = estimateOutputSavings(outputTokens, config);
   const origOutput = outputTokens + outputSaveEst;
 
-  const origCost   = calcCost(originalModel, origInput, origOutput);
+  const origCost   = calcCost(originalModel, origInput, origOutput, cachedTokens);
   const actualCost = calcCost(routedModel,   inputTokens, outputTokens, cachedTokens);
   const savings    = Math.max(0, origCost - actualCost);
-  const savingsPct = origCost > 0 ? (savings / origCost) * 100 : 0;
+  const savingsPct = origCost > 0 ? Math.min(100, (savings / origCost) * 100) : 0;
 
   const stats: RequestStats = {
     id: data.id ?? uuid(), timestamp: Date.now(),
@@ -264,9 +266,12 @@ async function handleStreaming(
     const outputSaveEst = estimateOutputSavings(outputTokens, config);
     const origInput  = inputTokens + inputTokensSaved + codeTokensSaved;
     const origOutput = outputTokens + outputSaveEst;
-    const origCost   = calcCost(originalModel, origInput, origOutput);
+    // Inclui cachedTokens no origCost para nao creditar o cache nativo do
+    // Claude Code como savings do TrimToken (que aconteceria sem o proxy).
+    const origCost   = calcCost(originalModel, origInput, origOutput, cachedTokens);
     const actualCost = calcCost(routedModel,   inputTokens, outputTokens, cachedTokens);
     const savings    = Math.max(0, origCost - actualCost);
+    const savingsPct = origCost > 0 ? Math.min(100, (savings / origCost) * 100) : 0;
     logRequest({
       id: uuid(), timestamp: Date.now(),
       original_model: originalModel, routed_model: routedModel,
@@ -275,7 +280,7 @@ async function handleStreaming(
       code_tokens_saved: codeTokensSaved,
       output_tokens_saved_est: outputSaveEst,
       original_cost_usd: origCost, actual_cost_usd: actualCost,
-      savings_usd: savings, savings_pct: origCost > 0 ? (savings / origCost) * 100 : 0,
+      savings_usd: savings, savings_pct: savingsPct,
       cache_hit: false, latency_ms: Date.now() - start,
     });
   });

@@ -90,10 +90,11 @@ export function getPricing(model: string): { input: number; output: number } {
 }
 
 export function calcCost(model: string, inputTokens: number, outputTokens: number, cachedTokens = 0): number {
+  // IMPORTANTE: a Anthropic retorna input_tokens (novos) e cache_read_input_tokens (cache)
+  // como valores SEPARADOS, nao somados. Por isso somamos os dois custos sem subtracao.
   const p = getPricing(model);
-  const billableInput = inputTokens - cachedTokens;
-  const cachedCost = (cachedTokens / 1_000_000) * p.input * 0.1; // cache = 10%
-  const inputCost  = (billableInput  / 1_000_000) * p.input;
-  const outputCost = (outputTokens   / 1_000_000) * p.output;
-  return cachedCost + inputCost + outputCost;
+  const inputCost  = (inputTokens  / 1_000_000) * p.input;        // 100% nos novos
+  const cachedCost = (cachedTokens / 1_000_000) * p.input * 0.1;  // 10% nos cacheados
+  const outputCost = (outputTokens / 1_000_000) * p.output;
+  return inputCost + cachedCost + outputCost;
 }
