@@ -93,10 +93,35 @@ function compressMessageContent(
 
   let totalSaved = 0;
   const newContent: AnthropicContent[] = msg.content.map((block) => {
-    if (block.type !== "text" || !block.text) return block;
-    const r = compressPreservingCode(block.text, aggressive);
-    totalSaved += r.saved;
-    return { ...block, text: r.text };
+    // Bloco de texto normal
+    if (block.type === "text" && block.text) {
+      const r = compressPreservingCode(block.text, aggressive);
+      totalSaved += r.saved;
+      return { ...block, text: r.text };
+    }
+    // tool_result: aqui mora a MAIOR parte dos tokens do Claude Code
+    // (saída de comando, leitura de arquivo). content pode ser string ou array.
+    if (block.type === "tool_result") {
+      const content = (block as { content?: unknown }).content;
+      if (typeof content === "string") {
+        const r = compressPreservingCode(content, aggressive);
+        totalSaved += r.saved;
+        return { ...block, content: r.text } as AnthropicContent;
+      }
+      if (Array.isArray(content)) {
+        const inner = content.map((c) => {
+          const cb = c as { type?: string; text?: string };
+          if (cb.type === "text" && cb.text) {
+            const r = compressPreservingCode(cb.text, aggressive);
+            totalSaved += r.saved;
+            return { ...cb, text: r.text };
+          }
+          return c;
+        });
+        return { ...block, content: inner } as AnthropicContent;
+      }
+    }
+    return block;
   });
 
   return { msg: { ...msg, content: newContent }, saved: totalSaved };

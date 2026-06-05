@@ -41,6 +41,28 @@ function estimateTokens(s: string): number {
   return Math.ceil(s.length / TOKEN_RATIO);
 }
 
+/**
+ * Saldo de chaves { } numa linha IGNORANDO strings ('...', "...", `...`) e
+ * comentários de linha (//). Evita corromper a profundidade com chaves
+ * literais, tipo  const x = "{ }";  — antes isso quebrava a compressão.
+ */
+function netBraces(line: string): number {
+  let depth = 0;
+  let quote: string | null = null;
+  for (let i = 0; i < line.length; i++) {
+    const ch = line[i];
+    if (quote) {
+      if (ch === quote && line[i - 1] !== "\\") quote = null;
+      continue;
+    }
+    if (ch === '"' || ch === "'" || ch === "`") { quote = ch; continue; }
+    if (ch === "/" && line[i + 1] === "/") break; // comentário de linha
+    if (ch === "{") depth++;
+    else if (ch === "}") depth--;
+  }
+  return depth;
+}
+
 function extractCodeBlocks(text: string): CodeBlock[] {
   const blocks: CodeBlock[] = [];
   let m: RegExpExecArray | null;
@@ -78,21 +100,13 @@ function compressJsTs(body: string, minLines: number): { body: string; saved: nu
     const fnStart = /^(\s*)(?:export\s+(?:default\s+)?|async\s+|static\s+|public\s+|private\s+|protected\s+)*((?:function\s+\w+|(?:const|let|var)\s+\w+\s*=\s*(?:async\s*)?(?:\([^)]*\)|\w+)\s*=>|\w+\s*\([^)]*\))[^{]*)\{/.exec(line);
 
     if (fnStart && !trimmed.endsWith("}")) {
-      const indent = fnStart[1];
       const signature = line;
-      // Acha o `}` correspondente (contagem simples de chaves)
-      let depth = 0;
-      for (const ch of line) {
-        if (ch === "{") depth++;
-        else if (ch === "}") depth--;
-      }
+      // Acha o `}` correspondente (contagem de chaves ciente de strings)
+      let depth = netBraces(line);
       const bodyStart = i;
       i++;
       while (i < lines.length && depth > 0) {
-        for (const ch of lines[i]) {
-          if (ch === "{") depth++;
-          else if (ch === "}") depth--;
-        }
+        depth += netBraces(lines[i]);
         i++;
       }
       const bodyEnd = i; // exclusive
@@ -186,14 +200,12 @@ function compressGo(body: string, minLines: number): { body: string; saved: numb
     const fnMatch = /^(\s*)func\s+(?:\([^)]*\)\s+)?(\w+)\s*\([^)]*\)[^{]*\{/.exec(line);
 
     if (fnMatch && !line.trim().endsWith("}")) {
-      const indent = fnMatch[1];
       const signature = line;
-      let depth = 0;
-      for (const ch of line) { if (ch === "{") depth++; else if (ch === "}") depth--; }
+      let depth = netBraces(line);
       const bodyStart = i;
       i++;
       while (i < lines.length && depth > 0) {
-        for (const ch of lines[i]) { if (ch === "{") depth++; else if (ch === "}") depth--; }
+        depth += netBraces(lines[i]);
         i++;
       }
       const bodyEnd = i;
@@ -264,7 +276,10 @@ function compressTextSegment(
     } else {
       const r = compressByLang(block.body, block.lang, minLines);
       totalSaved += r.saved;
-      out += `${block.fence}\n${r.body}\`\`\``;
+      // Garante newline antes do fence de fechamento (senão cola a última
+      // linha do código no ``` e corrompe o bloco).
+      const safeBody = r.body.endsWith("\n") ? r.body : r.body + "\n";
+      out += `${block.fence}\n${safeBody}\`\`\``;
     }
     cursor = block.end;
   }
@@ -300,7 +315,7 @@ export function compressCode(
   request: AnthropicRequest,
   config: Config
 ): { request: AnthropicRequest; stats: CodeCompressionStats } {
-  if (!config.code_compress?.enabled) {
+  if (!config.code_compress?.enabled || config.code_compress.level === "off") {
     return { request, stats: { tokens_saved: 0, blocks_compressed: 0 } };
   }
 

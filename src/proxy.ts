@@ -1,16 +1,47 @@
 import { Request, Response } from "express";
 import axios from "axios";
 import { v4 as uuid } from "uuid";
-import { Config, AnthropicRequest, RequestStats } from "./types";
-import { classifyComplexity, selectModel, calcCost, getPricing } from "./router";
+import { Config, AnthropicRequest, Usage, RequestStats } from "./types";
+import { computeCost, priceFor, normalizeUsage } from "./pricing";
+import { selectModel } from "./router";
 import { injectPromptCache } from "./promptCache";
-import { hashRequest, getCached, setCached } from "./cache";
-import { saveSession, extractSessionId } from "./session";
+import { hashRequest, getCached, setCached, CachedResponse } from "./cache";
 import { compressInput } from "./inputCompress";
 import { compressCode } from "./codeCompress";
 import { injectOutputCompression } from "./outputCompress";
 import { logRequest } from "./analytics";
 import { getUpstreamAgent, shouldUseUpstreamAgent } from "./upstreamAgent";
+
+const M = 1_000_000;
+
+// Headers que NÃO devem ser repassados (hop-by-hop + os que o axios recalcula).
+const SKIP_HEADERS = new Set([
+  "host", "content-length", "connection", "accept-encoding",
+  "transfer-encoding", "keep-alive", "proxy-authenticate",
+  "proxy-authorization", "te", "trailer", "upgrade",
+]);
+
+/**
+ * Repassa TODOS os headers do cliente (fiel), exceto hop-by-hop. Isso conserta
+ * o bug antigo que dropava anthropic-beta extra e quebrava features.
+ */
+function forwardHeaders(headers: Record<string, string | string[] | undefined>): Record<string, string> {
+  const out: Record<string, string> = {};
+  for (const [key, val] of Object.entries(headers)) {
+    if (val == null) continue;
+    if (SKIP_HEADERS.has(key.toLowerCase())) continue;
+    out[key] = Array.isArray(val) ? val.join(", ") : String(val);
+  }
+  return out;
+}
+
+function copyResponseHeaders(src: Record<string, unknown>, res: Response): void {
+  for (const [key, val] of Object.entries(src)) {
+    if (SKIP_HEADERS.has(key.toLowerCase())) continue;
+    if (key.toLowerCase() === "content-length") continue;
+    if (val != null) res.setHeader(key, val as string | string[]);
+  }
+}
 
 async function buildAxiosConfig(config: Config): Promise<{ httpsAgent?: import("https").Agent }> {
   if (!shouldUseUpstreamAgent(config)) return {};
@@ -18,203 +49,175 @@ async function buildAxiosConfig(config: Config): Promise<{ httpsAgent?: import("
   return { httpsAgent: agent };
 }
 
+function sendError(res: Response, err: unknown): void {
+  const e = err as { response?: { status: number; data: unknown }; message?: string };
+  const status = e.response?.status ?? 502;
+  if (!res.headersSent) {
+    res.status(status).json(e.response?.data ?? { error: { type: "proxy_error", message: e.message ?? "proxy error" } });
+  } else if (!res.writableEnded) {
+    res.end();
+  }
+}
+
 export function createProxyHandler(config: Config) {
   return async (req: Request, res: Response): Promise<void> => {
-    // Passa qualquer rota que não seja a API de mensagens sem modificar
-    if (!req.path.startsWith("/v1/messages")) {
-      const target = `${config.anthropic_api_url}${req.path}`;
-      try {
-        const extra = await buildAxiosConfig(config);
-        const resp = await axios({
-          method: req.method,
-          url: target,
-          data: req.body,
-          headers: forwardHeaders(req.headers as Record<string, string>),
-          validateStatus: () => true,
-          ...extra,
-        });
-        res.status(resp.status).send(resp.data);
-      } catch (err: unknown) {
-        const error = err as { response?: { status: number; data: unknown }; message: string };
-        const status = error.response?.status ?? 502;
-        res.status(status).json(error.response?.data ?? { error: error.message });
-      }
+    // Só POST /v1/messages passa pelo pipeline. Todo o resto (count_tokens,
+    // models, etc.) é repassado fielmente, sem nenhuma modificação.
+    if (req.method !== "POST" || req.path !== "/v1/messages") {
+      await passthrough(req, res, config);
       return;
     }
-
-    const start = Date.now();
-    const body = req.body as AnthropicRequest;
-    const originalModel = body.model;
-    const headers = req.headers as Record<string, string | string[] | undefined>;
-
-    // 1. Session memory
-    if (config.session_memory.enabled && body.messages) {
-      const sessionId = extractSessionId(headers, body.messages);
-      saveSession(sessionId, body.messages, config);
-    }
-
-    // 2. INPUT COMPRESSION (RTK-style) — comprime whitespace/dedup
-    const { request: compressedBody, stats: inputStats } = compressInput(body, config);
-
-    // 2.5 SMART CODE COMPRESSION (codesight-inspired) — comprime function bodies
-    const { request: codeCompressedBody, stats: codeStats } = compressCode(compressedBody, config);
-
-    // 3. Smart routing — só faz downgrade para Haiku em tarefas simples.
-    // Para standard/complex, preserva o modelo escolhido pelo Claude Code
-    // (evita erro 404 por nome de modelo desconhecido).
-    const complexity = classifyComplexity(codeCompressedBody);
-    const routedModel = (config.routing.enabled && complexity === "simple")
-      ? config.routing.models.simple
-      : body.model;
-    const routedBody: AnthropicRequest = { ...codeCompressedBody, model: routedModel };
-
-    // 4. OUTPUT COMPRESSION (Caveman) — instrui modelo a responder compacto
-    const compressedOutput = injectOutputCompression(routedBody, config);
-
-    // 5. Prompt cache — injeta cache_control
-    const finalBody = injectPromptCache(compressedOutput, config);
-
-    // 6. Response cache — retorna do cache se já vimos essa requisição
-    const reqHash = hashRequest(finalBody);
-    const cached = await getCached(reqHash);
-    if (cached && config.response_cache.enabled && !body.stream) {
-      const parsed = JSON.parse(cached);
-      const inputTokens  = parsed.usage?.input_tokens  ?? 0;
-      const outputTokens = parsed.usage?.output_tokens ?? 0;
-      const totalSavedFromCompress = inputStats.tokens_saved + codeStats.tokens_saved;
-      const origCost = calcCost(originalModel, inputTokens + totalSavedFromCompress, outputTokens);
-      logRequest({
-        id: uuid(), timestamp: Date.now(),
-        original_model: originalModel, routed_model: routedModel,
-        input_tokens: inputTokens, output_tokens: outputTokens, cached_tokens: inputTokens,
-        input_tokens_saved: inputStats.tokens_saved,
-        code_tokens_saved: codeStats.tokens_saved,
-        output_tokens_saved_est: 0,
-        original_cost_usd: origCost, actual_cost_usd: 0,
-        savings_usd: origCost, savings_pct: 100,
-        cache_hit: true, latency_ms: Date.now() - start,
-      });
-      res.status(200).json(parsed);
-      return;
-    }
-
-    // 7. Encaminha para a API Anthropic
-    try {
-      if (body.stream) {
-        await handleStreaming(req, res, finalBody, config, originalModel, routedModel, inputStats.tokens_saved, codeStats.tokens_saved, start);
-      } else {
-        await handleNormal(req, res, finalBody, config, originalModel, routedModel, inputStats.tokens_saved, codeStats.tokens_saved, reqHash, start);
-      }
-    } catch (err: unknown) {
-      const error = err as { response?: { status: number; data: unknown }; message: string };
-      const status = error.response?.status ?? 500;
-      res.status(status).json(error.response?.data ?? { error: error.message });
-    }
+    await handleMessages(req, res, config);
   };
+}
+
+/** Passthrough 100% fiel, via stream, com tratamento de erro e abort. */
+async function passthrough(req: Request, res: Response, config: Config): Promise<void> {
+  const method = req.method.toUpperCase();
+  const hasBody = method !== "GET" && method !== "HEAD";
+  try {
+    const extra = await buildAxiosConfig(config);
+    const resp = await axios({
+      method,
+      url: `${config.anthropic_api_url}${req.originalUrl}`,
+      data: hasBody ? req.body : undefined,
+      headers: forwardHeaders(req.headers as Record<string, string>),
+      responseType: "stream",
+      validateStatus: () => true,
+      maxRedirects: 0,
+      ...extra,
+    });
+    res.status(resp.status);
+    copyResponseHeaders(resp.headers as Record<string, unknown>, res);
+    const stream = resp.data as NodeJS.ReadableStream & { destroy?: () => void; destroyed?: boolean };
+    stream.on("error", () => { if (!res.writableEnded) res.end(); });
+    res.on("close", () => { if (stream.destroy && !stream.destroyed) stream.destroy(); });
+    stream.pipe(res);
+  } catch (err) {
+    sendError(res, err);
+  }
+}
+
+async function handleMessages(req: Request, res: Response, config: Config): Promise<void> {
+  const start = Date.now();
+  const original = req.body as AnthropicRequest;
+  if (!original || !Array.isArray(original.messages)) {
+    await passthrough(req, res, config);
+    return;
+  }
+  const originalModel = original.model;
+  const headers = forwardHeaders(req.headers as Record<string, string>);
+
+  // ── Pipeline de redução de tokens ──────────────────────────────
+  // 1. Input compression (whitespace/dedup/trunca logs) — preserva última msg
+  const { request: c1 } = compressInput(original, config);
+  // 2. Code compression (colapsa corpos de função no histórico)
+  const { request: c2 } = compressCode(c1, config);
+  // 3. Roteamento seguro (só troca modelo quando não quebra a sessão)
+  const routedModel = selectModel(c2, config);
+  const routed: AnthropicRequest = routedModel === c2.model ? c2 : { ...c2, model: routedModel };
+  // 4. Output compression (instrução de concisão no system)
+  const withOut = injectOutputCompression(routed, config);
+  // 5. Prompt cache seguro (só injeta se o cliente não usa cache_control)
+  const finalBody = injectPromptCache(withOut, config);
+
+  // 6. Response cache — resposta idêntica servida do cache (lossless)
+  const key = hashRequest(finalBody);
+  if (config.response_cache.enabled) {
+    const hit = await getCached(key);
+    if (hit) {
+      serveFromCache(res, hit, start);
+      return;
+    }
+  }
+
+  try {
+    if (finalBody.stream) {
+      await handleStreaming(res, original, finalBody, headers, originalModel, key, start, config);
+    } else {
+      await handleNormal(res, original, finalBody, headers, originalModel, key, start, config);
+    }
+  } catch (err) {
+    sendError(res, err);
+  }
+}
+
+function serveFromCache(res: Response, hit: CachedResponse, start: number): void {
+  const s = hit.stat;
+  logRequest({
+    id: uuid(),
+    timestamp: Date.now(),
+    model: s.model,
+    input_tokens: 0,
+    output_tokens: 0,
+    cache_read_tokens: 0,
+    cache_creation_tokens: 0,
+    original_input_tokens: s.original_input_tokens,
+    measured: s.measured,
+    real_cost_usd: 0,
+    baseline_cost_usd: s.baseline_cost_usd,
+    compression_savings_usd: s.compression_savings_usd,
+    cache_savings_usd: s.cache_savings_usd,
+    total_savings_usd: s.baseline_cost_usd, // vs. não otimizar nada
+    response_cache_hit: true,
+    response_cache_savings_usd: s.real_cost_usd, // o que deixou de pagar agora
+    latency_ms: Date.now() - start,
+  });
+
+  if (hit.kind === "stream") {
+    res.setHeader("Content-Type", "text/event-stream");
+    res.setHeader("Cache-Control", "no-cache");
+    res.status(200).send(hit.payload);
+  } else {
+    res.status(200).json(JSON.parse(hit.payload));
+  }
 }
 
 async function handleNormal(
-  req: Request, res: Response,
-  body: AnthropicRequest, config: Config,
-  originalModel: string, routedModel: string,
-  inputTokensSaved: number,
-  codeTokensSaved: number,
-  reqHash: string, start: number
+  res: Response, original: AnthropicRequest, finalBody: AnthropicRequest,
+  headers: Record<string, string>, originalModel: string, key: string,
+  start: number, config: Config,
 ): Promise<void> {
   const extra = await buildAxiosConfig(config);
-  const resp = await axios.post(
-    `${config.anthropic_api_url}/v1/messages`,
-    body,
-    { headers: forwardHeaders(req.headers as Record<string, string>), ...extra }
-  );
+  const resp = await axios.post(`${config.anthropic_api_url}/v1/messages`, finalBody, {
+    headers,
+    validateStatus: () => true,
+    ...extra,
+  });
 
-  const data = resp.data;
-  const inputTokens  = data.usage?.input_tokens  ?? 0;
-  const outputTokens = data.usage?.output_tokens ?? 0;
-  const cachedTokens = data.usage?.cache_read_input_tokens ?? 0;
-
-  // Custo "original" = sem otimizacoes do TrimToken, mas preservando cache nativo
-  // do Claude Code (que acontece independente do proxy). So creditamos savings
-  // reais do TrimToken (compressao + roteamento + estimativa de output).
-  const origInput  = inputTokens + inputTokensSaved + codeTokensSaved;
-  const outputSaveEst = estimateOutputSavings(outputTokens, config);
-  const origOutput = outputTokens + outputSaveEst;
-
-  const origCost   = calcCost(originalModel, origInput, origOutput, cachedTokens);
-  const actualCost = calcCost(routedModel,   inputTokens, outputTokens, cachedTokens);
-  const savings    = Math.max(0, origCost - actualCost);
-  const savingsPct = origCost > 0 ? Math.min(100, (savings / origCost) * 100) : 0;
-
-  const stats: RequestStats = {
-    id: data.id ?? uuid(), timestamp: Date.now(),
-    original_model: originalModel, routed_model: routedModel,
-    input_tokens: inputTokens, output_tokens: outputTokens, cached_tokens: cachedTokens,
-    input_tokens_saved: inputTokensSaved,
-    code_tokens_saved: codeTokensSaved,
-    output_tokens_saved_est: outputSaveEst,
-    original_cost_usd: origCost, actual_cost_usd: actualCost,
-    savings_usd: savings, savings_pct: savingsPct,
-    cache_hit: false, latency_ms: Date.now() - start,
-  };
-
-  logRequest(stats);
-
-  if (config.response_cache.enabled) {
-    setCached(reqHash, JSON.stringify(data), config.response_cache.ttl_seconds);
+  if (resp.status >= 400) {
+    res.status(resp.status).json(resp.data); // erro: repassa, não cacheia, não loga sucesso
+    return;
   }
 
-  res.status(resp.status).json(data);
-}
+  const data = resp.data;
+  res.status(resp.status).json(data); // serve o cliente IMEDIATAMENTE
 
-/**
- * Estima quantos tokens de output o Caveman economizou.
- * Como não temos o "controle" sem caveman, usamos um fator empírico
- * baseado no nível de compressão.
- */
-function estimateOutputSavings(actualOutputTokens: number, config: Config): number {
-  if (!config.output_compress?.enabled) return 0;
-  const factor: Record<string, number> = {
-    off: 0,
-    light: 0.20,      // ~20% economizado
-    medium: 0.45,     // ~45% economizado
-    aggressive: 0.65, // ~65% economizado
-  };
-  const f = factor[config.output_compress.level] ?? 0;
-  if (f === 0) return 0;
-  // se output real é X (já comprimido), original ≈ X / (1-f)
-  // então economia = X / (1-f) - X
-  return Math.round(actualOutputTokens * (f / (1 - f)));
+  // Medição + log + cache acontecem DEPOIS de responder (sem latência pro user)
+  const usage = normalizeUsage(data.usage);
+  const model = (data.model as string) || finalBody.model;
+  await finalizeStats({ original, usage, model, originalModel, headers, key, start, config, payload: JSON.stringify(data), kind: "json" });
 }
 
 async function handleStreaming(
-  req: Request, res: Response,
-  body: AnthropicRequest, config: Config,
-  originalModel: string, routedModel: string,
-  inputTokensSaved: number,
-  codeTokensSaved: number,
-  start: number
+  res: Response, original: AnthropicRequest, finalBody: AnthropicRequest,
+  headers: Record<string, string>, originalModel: string, key: string,
+  start: number, config: Config,
 ): Promise<void> {
   const extra = await buildAxiosConfig(config);
-  const resp = await axios.post(
-    `${config.anthropic_api_url}/v1/messages`,
-    body,
-    {
-      headers: { ...forwardHeaders(req.headers as Record<string, string>), "accept": "text/event-stream" },
-      responseType: "stream",
-      validateStatus: () => true,
-      ...extra,
-    }
-  );
+  const resp = await axios.post(`${config.anthropic_api_url}/v1/messages`, finalBody, {
+    headers: { ...headers, accept: "text/event-stream" },
+    responseType: "stream",
+    validateStatus: () => true,
+    ...extra,
+  });
 
-  // Se erro HTTP, lê o body do stream e retorna JSON legível
+  const stream = resp.data as NodeJS.ReadableStream & { destroy?: () => void; destroyed?: boolean };
+
   if (resp.status >= 400) {
-    const errorBody = await new Promise<string>((resolve) => {
-      let data = "";
-      resp.data.on("data", (chunk: Buffer) => { data += chunk.toString(); });
-      resp.data.on("end", () => resolve(data));
-    });
-    try { res.status(resp.status).json(JSON.parse(errorBody)); }
-    catch { res.status(resp.status).send(errorBody); }
+    const body = await readStream(stream);
+    try { res.status(resp.status).json(JSON.parse(body)); }
+    catch { res.status(resp.status).send(body); }
     return;
   }
 
@@ -223,76 +226,163 @@ async function handleStreaming(
   res.setHeader("Connection", "keep-alive");
   res.status(resp.status);
 
-  let inputTokens = 0, outputTokens = 0, cachedTokens = 0;
+  const usage: Usage = { input_tokens: 0, output_tokens: 0, cache_read_input_tokens: 0, cache_creation_input_tokens: 0 };
+  let model = finalBody.model;
   let sseBuffer = "";
+  const chunks: string[] = [];
+  let aborted = false;
 
-  resp.data.on("data", (chunk: Buffer) => {
+  res.on("close", () => {
+    aborted = true;
+    if (stream.destroy && !stream.destroyed) stream.destroy();
+  });
+
+  stream.on("data", (chunk: Buffer) => {
     const text = chunk.toString();
-    res.write(text); // repassa imediatamente pro client
+    res.write(text);
+    chunks.push(text);
 
-    // Parse SSE buffer linha-a-linha pra capturar usage corretamente
     sseBuffer += text;
     const lines = sseBuffer.split("\n");
     sseBuffer = lines.pop() ?? "";
-
     for (const line of lines) {
       if (!line.startsWith("data:")) continue;
       const payload = line.slice(5).trim();
       if (!payload || payload === "[DONE]") continue;
-
       try {
-        const event = JSON.parse(payload);
-
-        // message_start: vem com input_tokens e output_tokens inicial
-        if (event.type === "message_start" && event.message?.usage) {
-          const u = event.message.usage;
-          if (u.input_tokens)            inputTokens  = u.input_tokens;
-          if (u.output_tokens)           outputTokens = u.output_tokens;
-          if (u.cache_read_input_tokens) cachedTokens = u.cache_read_input_tokens;
+        const ev = JSON.parse(payload);
+        if (ev.type === "message_start" && ev.message) {
+          if (ev.message.model) model = ev.message.model;
+          mergeUsage(usage, ev.message.usage);
+        } else if (ev.type === "message_delta" && ev.usage) {
+          mergeUsage(usage, ev.usage);
         }
-
-        // message_delta: vem com output_tokens final
-        if (event.type === "message_delta" && event.usage) {
-          const u = event.usage;
-          if (u.input_tokens)            inputTokens  = u.input_tokens;
-          if (u.output_tokens)           outputTokens = u.output_tokens;
-          if (u.cache_read_input_tokens) cachedTokens = u.cache_read_input_tokens;
-        }
-      } catch { /* JSON incompleto entre chunks, ignora */ }
+      } catch { /* JSON parcial entre chunks */ }
     }
   });
 
-  resp.data.on("end", () => {
-    res.end();
-    const outputSaveEst = estimateOutputSavings(outputTokens, config);
-    const origInput  = inputTokens + inputTokensSaved + codeTokensSaved;
-    const origOutput = outputTokens + outputSaveEst;
-    // Inclui cachedTokens no origCost para nao creditar o cache nativo do
-    // Claude Code como savings do TrimToken (que aconteceria sem o proxy).
-    const origCost   = calcCost(originalModel, origInput, origOutput, cachedTokens);
-    const actualCost = calcCost(routedModel,   inputTokens, outputTokens, cachedTokens);
-    const savings    = Math.max(0, origCost - actualCost);
-    const savingsPct = origCost > 0 ? Math.min(100, (savings / origCost) * 100) : 0;
-    logRequest({
-      id: uuid(), timestamp: Date.now(),
-      original_model: originalModel, routed_model: routedModel,
-      input_tokens: inputTokens, output_tokens: outputTokens, cached_tokens: cachedTokens,
-      input_tokens_saved: inputTokensSaved,
-      code_tokens_saved: codeTokensSaved,
-      output_tokens_saved_est: outputSaveEst,
-      original_cost_usd: origCost, actual_cost_usd: actualCost,
-      savings_usd: savings, savings_pct: savingsPct,
-      cache_hit: false, latency_ms: Date.now() - start,
-    });
+  // FIX crítico: sem isto, qualquer soluço no upstream travava o cliente p/ sempre.
+  stream.on("error", () => { if (!res.writableEnded) res.end(); });
+
+  stream.on("end", () => {
+    if (!res.writableEnded) res.end();
+    if (aborted) return;
+    void finalizeStats({ original, usage, model, originalModel, headers, key, start, config, payload: chunks.join(""), kind: "stream" });
   });
 }
 
-function forwardHeaders(headers: Record<string, string | string[] | undefined>): Record<string, string> {
-  const result: Record<string, string> = {};
-  const allowed = ["x-api-key", "anthropic-version", "content-type", "anthropic-beta", "authorization"];
-  for (const key of allowed) {
-    const val = headers[key];
-    if (val) result[key] = Array.isArray(val) ? val[0] : val;
+interface FinalizeArgs {
+  original: AnthropicRequest;
+  usage: Usage;
+  model: string;
+  originalModel: string;
+  headers: Record<string, string>;
+  key: string;
+  start: number;
+  config: Config;
+  payload: string;
+  kind: "json" | "stream";
+}
+
+/** Mede economia real (count_tokens), calcula custos reais, loga e cacheia. */
+async function finalizeStats(a: FinalizeArgs): Promise<void> {
+  try {
+    const { usage, model, originalModel, config } = a;
+    const actualInput = usage.input_tokens + usage.cache_read_input_tokens + usage.cache_creation_input_tokens;
+
+    // Tokens do request ORIGINAL (antes de qualquer compressão), medidos pela
+    // própria Anthropic via count_tokens (grátis). Sem isso, não inventamos.
+    let originalInput = actualInput;
+    let measured = false;
+    if (config.measure_savings) {
+      const counted = await countOriginalTokens(a.original, a.headers, config);
+      if (counted != null) { originalInput = counted; measured = true; }
+    }
+
+    const priceActual = priceFor(model, config);
+    const priceOrig = priceFor(originalModel, config);
+
+    const real = computeCost(model, usage, config).real;
+    // baseline = request original, no modelo original, SEM cache nem compressão
+    const baseline = (originalInput * priceOrig.input + usage.output_tokens * priceOrig.output) / M;
+
+    const compressionSavings = ((originalInput - actualInput) * priceOrig.input) / M;
+    const cacheSavings =
+      ((usage.cache_read_input_tokens * 0.9 - usage.cache_creation_input_tokens * 0.25) * priceActual.input) / M;
+    const totalSavings = baseline - real;
+
+    const stat: RequestStats = {
+      id: uuid(),
+      timestamp: Date.now(),
+      model,
+      input_tokens: usage.input_tokens,
+      output_tokens: usage.output_tokens,
+      cache_read_tokens: usage.cache_read_input_tokens,
+      cache_creation_tokens: usage.cache_creation_input_tokens,
+      original_input_tokens: originalInput,
+      measured,
+      real_cost_usd: real,
+      baseline_cost_usd: baseline,
+      compression_savings_usd: compressionSavings,
+      cache_savings_usd: cacheSavings,
+      total_savings_usd: totalSavings,
+      response_cache_hit: false,
+      response_cache_savings_usd: 0,
+      latency_ms: Date.now() - a.start,
+    };
+    logRequest(stat);
+
+    if (config.response_cache.enabled) {
+      const envelope: CachedResponse = { kind: a.kind, payload: a.payload, stat };
+      await setCached(a.key, envelope, config.response_cache.ttl_seconds);
+    }
+  } catch {
+    // Medição/log nunca podem derrubar o fluxo principal.
   }
-  return result;
+}
+
+/** Conta os tokens do request original usando o tokenizer real da Anthropic. */
+async function countOriginalTokens(
+  original: AnthropicRequest, headers: Record<string, string>, config: Config,
+): Promise<number | null> {
+  try {
+    const payload: Record<string, unknown> = {
+      model: original.model,
+      messages: original.messages,
+    };
+    if (original.system) payload.system = original.system;
+    if (original.tools) payload.tools = original.tools;
+    if (original.tool_choice) payload.tool_choice = original.tool_choice;
+
+    const extra = await buildAxiosConfig(config);
+    const resp = await axios.post(`${config.anthropic_api_url}/v1/messages/count_tokens`, payload, {
+      headers,
+      validateStatus: () => true,
+      timeout: 8000,
+      ...extra,
+    });
+    if (resp.status === 200 && typeof resp.data?.input_tokens === "number") {
+      return resp.data.input_tokens as number;
+    }
+    return null;
+  } catch {
+    return null;
+  }
+}
+
+function mergeUsage(target: Usage, u: Record<string, number | undefined> | undefined): void {
+  if (!u) return;
+  if (typeof u.input_tokens === "number") target.input_tokens = u.input_tokens;
+  if (typeof u.output_tokens === "number") target.output_tokens = u.output_tokens;
+  if (typeof u.cache_read_input_tokens === "number") target.cache_read_input_tokens = u.cache_read_input_tokens;
+  if (typeof u.cache_creation_input_tokens === "number") target.cache_creation_input_tokens = u.cache_creation_input_tokens;
+}
+
+function readStream(stream: NodeJS.ReadableStream): Promise<string> {
+  return new Promise((resolve) => {
+    let data = "";
+    stream.on("data", (c: Buffer) => { data += c.toString(); });
+    stream.on("end", () => resolve(data));
+    stream.on("error", () => resolve(data));
+  });
 }

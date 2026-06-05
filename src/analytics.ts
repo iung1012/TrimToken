@@ -7,90 +7,151 @@ interface DbSchema {
   requests: RequestStats[];
 }
 
-let dbPath: string;
+const MAX_RECORDS = 50_000;
+
+let dbPath = "";
+let tmpPath = "";
 let data: DbSchema = { requests: [] };
+let persistTimer: NodeJS.Timeout | null = null;
+let dirty = false;
 
 export function initDb(): void {
-  const dir = path.join(os.homedir(), ".claudesave");
+  const dir = path.join(os.homedir(), ".trimtoken");
   if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
   dbPath = path.join(dir, "analytics.json");
+  tmpPath = path.join(dir, "analytics.json.tmp");
 
   if (fs.existsSync(dbPath)) {
     try {
       data = JSON.parse(fs.readFileSync(dbPath, "utf8"));
+      if (!Array.isArray(data.requests)) data = { requests: [] };
     } catch {
       data = { requests: [] };
     }
   }
 }
 
-function persist() {
-  // Mantém apenas os últimos 10.000 registros para não crescer infinitamente
-  if (data.requests.length > 10_000) {
-    data.requests = data.requests.slice(-10_000);
+// Persistência assíncrona com debounce — NUNCA bloqueia o event loop por request.
+function schedulePersist(): void {
+  dirty = true;
+  if (persistTimer) return;
+  persistTimer = setTimeout(() => {
+    persistTimer = null;
+    void persist();
+  }, 1500);
+}
+
+async function persist(): Promise<void> {
+  if (!dirty || !dbPath) return;
+  dirty = false;
+  try {
+    await fs.promises.writeFile(tmpPath, JSON.stringify(data), "utf8");
+    await fs.promises.rename(tmpPath, dbPath); // escrita atômica
+  } catch {
+    dirty = true; // tenta de novo no próximo ciclo
   }
-  fs.writeFileSync(dbPath, JSON.stringify(data), "utf8");
+}
+
+/** Garante que tudo foi gravado (chamar no shutdown). */
+export async function flush(): Promise<void> {
+  if (persistTimer) {
+    clearTimeout(persistTimer);
+    persistTimer = null;
+  }
+  await persist();
 }
 
 export function logRequest(stats: RequestStats): void {
   data.requests.push(stats);
-  persist();
+  if (data.requests.length > MAX_RECORDS) {
+    data.requests = data.requests.slice(-MAX_RECORDS);
+  }
+  schedulePersist();
 }
 
-export function getSummary(days = 7): {
+export interface Summary {
   total_requests: number;
-  total_original_cost: number;
-  total_actual_cost: number;
-  total_savings: number;
-  avg_savings_pct: number;
-  cache_hits: number;
-  total_input_tokens: number;
-  total_output_tokens: number;
-  total_input_tokens_saved: number;
-  total_code_tokens_saved: number;
-  total_output_tokens_saved: number;
-  total_cached_tokens: number;
-  model_breakdown: Record<string, number>;
-} {
-  const since = Date.now() - days * 86400_000;
+  api_calls: number;
+  response_cache_hits: number;
+
+  // Dinheiro (real)
+  real_cost_usd: number;        // o que você pagou
+  baseline_cost_usd: number;    // o que pagaria sem otimização nenhuma
+  total_savings_usd: number;    // baseline - real
+  compression_savings_usd: number;
+  cache_savings_usd: number;
+  response_cache_savings_usd: number;
+  savings_pct: number;
+
+  // Tokens (reais, processados pela API)
+  input_tokens: number;
+  output_tokens: number;
+  cache_read_tokens: number;
+  cache_creation_tokens: number;
+  original_input_tokens: number; // o que teria sido enviado sem compressão
+  input_tokens_saved: number;    // original - real enviado
+
+  measured_pct: number;          // % das requisições com economia MEDIDA (count_tokens)
+  model_breakdown: Record<string, { requests: number; cost_usd: number }>;
+}
+
+export function getSummary(days = 7): Summary {
+  const since = Date.now() - days * 86_400_000;
   const rows = data.requests.filter((r) => r.timestamp >= since);
 
-  const total_original_cost = rows.reduce((s, r) => s + r.original_cost_usd, 0);
-  const total_actual_cost   = rows.reduce((s, r) => s + r.actual_cost_usd, 0);
-  const total_savings       = rows.reduce((s, r) => s + r.savings_usd, 0);
-  // % real = economia total / custo original total (não média de percentuais por request)
-  const avg_savings_pct     = total_original_cost > 0 ? Math.min(100, (total_savings / total_original_cost) * 100) : 0;
-  const cache_hits          = rows.filter((r) => r.cache_hit).length;
+  let real = 0, baseline = 0, compSav = 0, cacheSav = 0, respSav = 0, totalSav = 0;
+  let inTok = 0, outTok = 0, cacheRead = 0, cacheCreate = 0, origInTok = 0;
+  let apiCalls = 0, respHits = 0, measuredCount = 0;
+  const model_breakdown: Record<string, { requests: number; cost_usd: number }> = {};
 
-  const total_input_tokens        = rows.reduce((s, r) => s + r.input_tokens, 0);
-  const total_output_tokens       = rows.reduce((s, r) => s + r.output_tokens, 0);
-  const total_input_tokens_saved  = rows.reduce((s, r) => s + (r.input_tokens_saved ?? 0), 0);
-  const total_code_tokens_saved   = rows.reduce((s, r) => s + (r.code_tokens_saved ?? 0), 0);
-  const total_output_tokens_saved = rows.reduce((s, r) => s + (r.output_tokens_saved_est ?? 0), 0);
-  const total_cached_tokens       = rows.reduce((s, r) => s + r.cached_tokens, 0);
-
-  const model_breakdown: Record<string, number> = {};
   for (const r of rows) {
-    model_breakdown[r.routed_model] = (model_breakdown[r.routed_model] ?? 0) + 1;
+    real += r.real_cost_usd;
+    baseline += r.baseline_cost_usd;
+    compSav += r.compression_savings_usd;
+    cacheSav += r.cache_savings_usd;
+    respSav += r.response_cache_savings_usd;
+    totalSav += r.total_savings_usd + r.response_cache_savings_usd;
+
+    inTok += r.input_tokens;
+    outTok += r.output_tokens;
+    cacheRead += r.cache_read_tokens;
+    cacheCreate += r.cache_creation_tokens;
+    origInTok += r.original_input_tokens;
+
+    if (r.response_cache_hit) respHits++; else apiCalls++;
+    if (r.measured) measuredCount++;
+
+    const mb = model_breakdown[r.model] ?? { requests: 0, cost_usd: 0 };
+    mb.requests++;
+    mb.cost_usd += r.real_cost_usd;
+    model_breakdown[r.model] = mb;
   }
+
+  const savings_pct = baseline > 0 ? Math.max(0, Math.min(100, (totalSav / baseline) * 100)) : 0;
+  const realInputSent = inTok + cacheRead + cacheCreate;
 
   return {
     total_requests: rows.length,
-    total_original_cost,
-    total_actual_cost,
-    total_savings,
-    avg_savings_pct,
-    cache_hits,
-    total_input_tokens,
-    total_output_tokens,
-    total_input_tokens_saved,
-    total_code_tokens_saved,
-    total_output_tokens_saved,
-    total_cached_tokens,
+    api_calls: apiCalls,
+    response_cache_hits: respHits,
+    real_cost_usd: real,
+    baseline_cost_usd: baseline,
+    total_savings_usd: totalSav,
+    compression_savings_usd: compSav,
+    cache_savings_usd: cacheSav,
+    response_cache_savings_usd: respSav,
+    savings_pct,
+    input_tokens: inTok,
+    output_tokens: outTok,
+    cache_read_tokens: cacheRead,
+    cache_creation_tokens: cacheCreate,
+    original_input_tokens: origInTok,
+    input_tokens_saved: Math.max(0, origInTok - realInputSent),
+    measured_pct: rows.length > 0 ? (measuredCount / rows.length) * 100 : 0,
     model_breakdown,
   };
 }
 
-export function getRecentRequests(limit = 50): RequestStats[] {
+export function getRecentRequests(limit = 100): RequestStats[] {
   return [...data.requests].reverse().slice(0, limit);
 }

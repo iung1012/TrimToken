@@ -25,7 +25,6 @@ function extractText(messages: AnthropicMessage[]): string {
 }
 
 function estimateTokens(text: string): number {
-  // ~4 chars per token (boa aproximação para inglês/código)
   return Math.ceil(text.length / 4);
 }
 
@@ -39,14 +38,11 @@ export function classifyComplexity(request: AnthropicRequest): Complexity {
   const codeBlocks = countCodeBlocks(text);
   const historyLength = request.messages.length;
 
-  // Forçar modelo específico se já foi roteado pelo usuário
   if (request.model.includes("opus")) return "complex";
   if (request.model.includes("haiku")) return "simple";
 
-  // Padrões explícitos de complexidade alta
   if (COMPLEX_PATTERNS.some((p) => p.test(text))) return "complex";
 
-  // Score de complexidade (0-10)
   let score = 0;
   if (tokens > 2000) score += 3;
   else if (tokens > 500) score += 1;
@@ -57,7 +53,6 @@ export function classifyComplexity(request: AnthropicRequest): Complexity {
   if (/implement|build|create|fix|debug|refactor|optimize/i.test(text)) score += 2;
   if (/test|spec|unit test|coverage/i.test(text)) score += 1;
 
-  // Padrões explícitos de simplicidade
   if (SIMPLE_PATTERNS.some((p) => p.test(text.trim()))) score -= 3;
 
   if (score >= 5) return "complex";
@@ -65,36 +60,30 @@ export function classifyComplexity(request: AnthropicRequest): Complexity {
   return "simple";
 }
 
-export function selectModel(complexity: Complexity, config: Config): string {
-  if (!config.routing.enabled) return config.routing.models.standard;
-  return config.routing.models[complexity];
-}
+/**
+ * Decide o modelo final de forma SEGURA.
+ *
+ * Em modo safe_only (padrão), só faz downgrade para o modelo "simple" quando:
+ *   - não há tools na requisição (não é um turno agêntico), E
+ *   - há no máximo 1 mensagem (não estamos no meio de uma conversa).
+ * Caso contrário, mantém o modelo original — assim a qualidade nunca cai
+ * inesperadamente no meio de uma sessão do Claude Code.
+ *
+ * Retorna o nome do modelo a usar (igual ao original se nada mudar).
+ */
+export function selectModel(request: AnthropicRequest, config: Config): string {
+  if (!config.routing.enabled) return request.model;
 
-// Custo por 1M tokens (input/output) em USD
-const MODEL_PRICING: Record<string, { input: number; output: number }> = {
-  "claude-haiku-3-5-20241022": { input: 0.80, output: 4.00 },
-  "claude-sonnet-4-5":         { input: 3.00, output: 15.00 },
-  "claude-opus-4-5":           { input: 15.00, output: 75.00 },
-  // fallback genérico por família
-  "haiku":  { input: 0.80, output: 4.00 },
-  "sonnet": { input: 3.00, output: 15.00 },
-  "opus":   { input: 15.00, output: 75.00 },
-};
+  const hasTools = Array.isArray(request.tools) && (request.tools as unknown[]).length > 0;
+  const hasHistory = request.messages.length > 1;
 
-export function getPricing(model: string): { input: number; output: number } {
-  if (MODEL_PRICING[model]) return MODEL_PRICING[model];
-  if (model.includes("haiku"))  return MODEL_PRICING["haiku"];
-  if (model.includes("sonnet")) return MODEL_PRICING["sonnet"];
-  if (model.includes("opus"))   return MODEL_PRICING["opus"];
-  return MODEL_PRICING["sonnet"];
-}
+  if (config.routing.safe_only && (hasTools || hasHistory)) {
+    return request.model; // contexto agêntico → não arrisca
+  }
 
-export function calcCost(model: string, inputTokens: number, outputTokens: number, cachedTokens = 0): number {
-  // IMPORTANTE: a Anthropic retorna input_tokens (novos) e cache_read_input_tokens (cache)
-  // como valores SEPARADOS, nao somados. Por isso somamos os dois custos sem subtracao.
-  const p = getPricing(model);
-  const inputCost  = (inputTokens  / 1_000_000) * p.input;        // 100% nos novos
-  const cachedCost = (cachedTokens / 1_000_000) * p.input * 0.1;  // 10% nos cacheados
-  const outputCost = (outputTokens / 1_000_000) * p.output;
-  return inputCost + cachedCost + outputCost;
+  const complexity = classifyComplexity(request);
+  if (complexity === "simple") return config.routing.models.simple;
+  // standard/complex: preserva o modelo escolhido pelo cliente (evita 404 e
+  // nunca faz "upgrade" não solicitado).
+  return request.model;
 }
