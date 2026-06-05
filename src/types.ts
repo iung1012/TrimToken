@@ -49,6 +49,12 @@ export interface Config {
   // É grátis e roda DEPOIS da resposta (não adiciona latência pro usuário).
   measure_savings: boolean;
 
+  // Aplicar compressão/output-compress mesmo em clientes que JÁ cacheiam
+  // (ex.: Claude Code)? Padrão: false. Mexer no que o cliente cacheia tende a
+  // FURAR o cache nativo e sair mais caro — comprovado por medição. Deixe false
+  // a não ser que esteja experimentando e acompanhando os números reais.
+  compress_cached_clients: boolean;
+
   dashboard: {
     enabled: boolean;
     path: string;
@@ -128,9 +134,11 @@ export interface RequestStats {
   // Dinheiro
   real_cost_usd: number;            // pago de fato
   baseline_cost_usd: number;        // request original, sem cache nem compressão
-  compression_savings_usd: number;  // economia por remover tokens do input
-  cache_savings_usd: number;        // economia por prompt cache
-  total_savings_usd: number;        // soma das economias vs. baseline
+  compression_savings_usd: number;  // economia por remover tokens do input (proxy)
+  cache_savings_usd: number;        // economia por prompt cache (real)
+  total_savings_usd: number;        // economia ATRIBUÍVEL ao TrimToken
+
+  client_cached: boolean;           // cliente já usava cache_control (ex.: Claude Code)?
 
   response_cache_hit: boolean;
   response_cache_savings_usd: number;

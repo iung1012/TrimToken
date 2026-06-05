@@ -4,7 +4,7 @@ import { v4 as uuid } from "uuid";
 import { Config, AnthropicRequest, Usage, RequestStats } from "./types";
 import { computeCost, priceFor, normalizeUsage } from "./pricing";
 import { selectModel } from "./router";
-import { injectPromptCache } from "./promptCache";
+import { injectPromptCache, hasCacheControl } from "./promptCache";
 import { hashRequest, getCached, setCached, CachedResponse } from "./cache";
 import { compressInput } from "./inputCompress";
 import { compressCode } from "./codeCompress";
@@ -108,18 +108,25 @@ async function handleMessages(req: Request, res: Response, config: Config): Prom
   const originalModel = original.model;
   const headers = forwardHeaders(req.headers as Record<string, string>);
 
-  // ── Pipeline de redução de tokens ──────────────────────────────
-  // 1. Input compression (whitespace/dedup/trunca logs) — preserva última msg
-  const { request: c1 } = compressInput(original, config);
-  // 2. Code compression (colapsa corpos de função no histórico)
-  const { request: c2 } = compressCode(c1, config);
-  // 3. Roteamento seguro (só troca modelo quando não quebra a sessão)
-  const routedModel = selectModel(c2, config);
-  const routed: AnthropicRequest = routedModel === c2.model ? c2 : { ...c2, model: routedModel };
-  // 4. Output compression (instrução de concisão no system)
-  const withOut = injectOutputCompression(routed, config);
-  // 5. Prompt cache seguro (só injeta se o cliente não usa cache_control)
-  const finalBody = injectPromptCache(withOut, config);
+  // Cliente já cacheia (Claude Code)? Se sim, mexer no corpo tende a FURAR o
+  // cache nativo e sair MAIS caro (comprovado por medição). Então só medimos +
+  // response cache, sem tocar no que ele manda. Compressão fica p/ API crua.
+  const clientCaches = hasCacheControl(original);
+  const optimize = !clientCaches || config.compress_cached_clients;
+
+  let finalBody: AnthropicRequest;
+  if (optimize) {
+    // ── Pipeline de redução de tokens (clientes sem cache nativo) ──
+    const { request: c1 } = compressInput(original, config);        // whitespace/dedup/logs
+    const { request: c2 } = compressCode(c1, config);               // colapsa corpos de função
+    const routedModel = selectModel(c2, config);                    // roteamento seguro
+    const routed: AnthropicRequest = routedModel === c2.model ? c2 : { ...c2, model: routedModel };
+    const withOut = injectOutputCompression(routed, config);        // concisão no system
+    finalBody = injectPromptCache(withOut, config);                 // cache_control seguro
+  } else {
+    // Modo medir-sem-atrapalhar: repassa intacto.
+    finalBody = original;
+  }
 
   // 6. Response cache — resposta idêntica servida do cache (lossless)
   const key = hashRequest(finalBody);
@@ -133,9 +140,9 @@ async function handleMessages(req: Request, res: Response, config: Config): Prom
 
   try {
     if (finalBody.stream) {
-      await handleStreaming(res, original, finalBody, headers, originalModel, key, start, config);
+      await handleStreaming(res, original, finalBody, headers, originalModel, key, start, config, clientCaches);
     } else {
-      await handleNormal(res, original, finalBody, headers, originalModel, key, start, config);
+      await handleNormal(res, original, finalBody, headers, originalModel, key, start, config, clientCaches);
     }
   } catch (err) {
     sendError(res, err);
@@ -152,15 +159,16 @@ function serveFromCache(res: Response, hit: CachedResponse, start: number): void
     output_tokens: 0,
     cache_read_tokens: 0,
     cache_creation_tokens: 0,
-    original_input_tokens: s.original_input_tokens,
-    measured: s.measured,
+    original_input_tokens: 0,
+    measured: false,
     real_cost_usd: 0,
-    baseline_cost_usd: s.baseline_cost_usd,
-    compression_savings_usd: s.compression_savings_usd,
-    cache_savings_usd: s.cache_savings_usd,
-    total_savings_usd: s.baseline_cost_usd, // vs. não otimizar nada
+    baseline_cost_usd: 0,
+    compression_savings_usd: 0,
+    cache_savings_usd: 0,
+    total_savings_usd: 0,
+    client_cached: s.client_cached,
     response_cache_hit: true,
-    response_cache_savings_usd: s.real_cost_usd, // o que deixou de pagar agora
+    response_cache_savings_usd: s.real_cost_usd, // custo evitado por não chamar a API
     latency_ms: Date.now() - start,
   });
 
@@ -176,7 +184,7 @@ function serveFromCache(res: Response, hit: CachedResponse, start: number): void
 async function handleNormal(
   res: Response, original: AnthropicRequest, finalBody: AnthropicRequest,
   headers: Record<string, string>, originalModel: string, key: string,
-  start: number, config: Config,
+  start: number, config: Config, clientCaches: boolean,
 ): Promise<void> {
   const extra = await buildAxiosConfig(config);
   const resp = await axios.post(`${config.anthropic_api_url}/v1/messages`, finalBody, {
@@ -196,13 +204,13 @@ async function handleNormal(
   // Medição + log + cache acontecem DEPOIS de responder (sem latência pro user)
   const usage = normalizeUsage(data.usage);
   const model = (data.model as string) || finalBody.model;
-  await finalizeStats({ original, usage, model, originalModel, headers, key, start, config, payload: JSON.stringify(data), kind: "json" });
+  await finalizeStats({ original, usage, model, originalModel, headers, key, start, config, clientCaches, payload: JSON.stringify(data), kind: "json" });
 }
 
 async function handleStreaming(
   res: Response, original: AnthropicRequest, finalBody: AnthropicRequest,
   headers: Record<string, string>, originalModel: string, key: string,
-  start: number, config: Config,
+  start: number, config: Config, clientCaches: boolean,
 ): Promise<void> {
   const extra = await buildAxiosConfig(config);
   const resp = await axios.post(`${config.anthropic_api_url}/v1/messages`, finalBody, {
@@ -267,7 +275,7 @@ async function handleStreaming(
   stream.on("end", () => {
     if (!res.writableEnded) res.end();
     if (aborted) return;
-    void finalizeStats({ original, usage, model, originalModel, headers, key, start, config, payload: chunks.join(""), kind: "stream" });
+    void finalizeStats({ original, usage, model, originalModel, headers, key, start, config, clientCaches, payload: chunks.join(""), kind: "stream" });
   });
 }
 
@@ -280,6 +288,7 @@ interface FinalizeArgs {
   key: string;
   start: number;
   config: Config;
+  clientCaches: boolean;
   payload: string;
   kind: "json" | "stream";
 }
@@ -306,10 +315,13 @@ async function finalizeStats(a: FinalizeArgs): Promise<void> {
     // baseline = request original, no modelo original, SEM cache nem compressão
     const baseline = (originalInput * priceOrig.input + usage.output_tokens * priceOrig.output) / M;
 
+    // Economia por remover tokens do input (atribuível ao proxy)
     const compressionSavings = ((originalInput - actualInput) * priceOrig.input) / M;
+    // Economia do prompt cache (real). Só é MÉRITO do proxy quando foi ele quem
+    // injetou o cache_control; se o cliente já cacheia, isso é cache nativo dele.
     const cacheSavings =
       ((usage.cache_read_input_tokens * 0.9 - usage.cache_creation_input_tokens * 0.25) * priceActual.input) / M;
-    const totalSavings = baseline - real;
+    const totalSavings = compressionSavings + (a.clientCaches ? 0 : cacheSavings);
 
     const stat: RequestStats = {
       id: uuid(),
@@ -326,6 +338,7 @@ async function finalizeStats(a: FinalizeArgs): Promise<void> {
       compression_savings_usd: compressionSavings,
       cache_savings_usd: cacheSavings,
       total_savings_usd: totalSavings,
+      client_cached: a.clientCaches,
       response_cache_hit: false,
       response_cache_savings_usd: 0,
       latency_ms: Date.now() - a.start,

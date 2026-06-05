@@ -90,11 +90,10 @@ function renderDashboard(base: string): string {
         <th>Output</th>
         <th>Tokens economizados</th>
         <th>Custo real</th>
-        <th>Você teria pago</th>
-        <th>Economia</th>
+        <th>Economia TrimToken</th>
       </tr>
     </thead>
-    <tbody id="rows"><tr><td colspan="9" class="empty">Sem requisições ainda — configure ANTHROPIC_BASE_URL=http://localhost:8019</td></tr></tbody>
+    <tbody id="rows"><tr><td colspan="8" class="empty">Sem requisições ainda — configure ANTHROPIC_BASE_URL=http://localhost:8019</td></tr></tbody>
   </table>
 
   <script>
@@ -116,9 +115,9 @@ function renderDashboard(base: string): string {
       ]);
 
       document.getElementById('note').innerHTML =
-        '🔒 Todos os números vêm do campo <b>usage</b> real da API Anthropic. ' +
-        'Economia <b>medida</b> em ' + (s.measured_pct||0).toFixed(0) + '% das requisições via count_tokens (tokenizer oficial). ' +
-        'Nada estimado às cegas.';
+        '🔒 Números do campo <b>usage</b> real da API. <b>Economia do TrimToken</b> = só o que o proxy realmente poupou ' +
+        '(compressão + response cache). O <b>cache nativo</b> do seu cliente (Claude Code) é mostrado à parte, pois acontece com ou sem o proxy. ' +
+        'Medido via count_tokens em ' + (s.measured_pct||0).toFixed(0) + '% das requisições.';
 
       document.getElementById('cards').innerHTML = \`
         <div class="card spent">
@@ -127,19 +126,19 @@ function renderDashboard(base: string): string {
           <div class="sub">o que você efetivamente pagou</div>
         </div>
         <div class="card savings">
-          <div class="label">Economia total (real)</div>
-          <div class="value">\${usd(s.total_savings_usd)}</div>
-          <div class="sub">vs. \${usd(s.baseline_cost_usd)} sem otimização</div>
+          <div class="label">Economia do TrimToken (real)</div>
+          <div class="value">\${usd(s.trimtoken_savings_usd)}</div>
+          <div class="sub">\${(s.savings_pct||0).toFixed(1)}% — compressão + response cache</div>
         </div>
         <div class="card">
-          <div class="label">% economizado</div>
-          <div class="value">\${(s.savings_pct||0).toFixed(1)}%</div>
-          <div class="sub">medido, não estimado</div>
+          <div class="label">Cache nativo do cliente (info)</div>
+          <div class="value">\${usd(s.native_cache_savings_usd)}</div>
+          <div class="sub">economia do Claude Code, não do proxy</div>
         </div>
         <div class="card tokens">
           <div class="label">Tokens de input poupados</div>
           <div class="value">\${fmtTok(s.input_tokens_saved)}</div>
-          <div class="sub">de \${fmtTok(s.original_input_tokens)} originais</div>
+          <div class="sub">de \${fmtTok(s.original_input_tokens)} medidos</div>
         </div>
         <div class="card hits">
           <div class="label">Requisições</div>
@@ -155,9 +154,9 @@ function renderDashboard(base: string): string {
           <div class="desc">tokens removidos do request</div>
         </div>
         <div class="layer">
-          <div class="name">Prompt cache</div>
-          <div class="amount">\${usd(s.cache_savings_usd)}</div>
-          <div class="desc">leitura a 10% (real)</div>
+          <div class="name">Cache nativo (info)</div>
+          <div class="amount">\${usd(s.native_cache_savings_usd)}</div>
+          <div class="desc">cache do cliente, não do proxy</div>
         </div>
         <div class="layer">
           <div class="name">Response cache</div>
@@ -177,10 +176,11 @@ function renderDashboard(base: string): string {
       \`;
 
       document.getElementById('rows').innerHTML = requests.length === 0
-        ? '<tr><td colspan="9" class="empty">Sem requisições ainda</td></tr>'
+        ? '<tr><td colspan="8" class="empty">Sem requisições ainda</td></tr>'
         : requests.map(r => {
           const saved = (r.total_savings_usd||0) + (r.response_cache_savings_usd||0);
           const tokSaved = Math.max(0, (r.original_input_tokens||0) - (r.input_tokens + r.cache_read_tokens + r.cache_creation_tokens));
+          const savedCls = saved < 0 ? 'miss' : 'hit';
           return \`
           <tr>
             <td>\${new Date(r.timestamp).toLocaleTimeString('pt-BR')}</td>
@@ -190,8 +190,7 @@ function renderDashboard(base: string): string {
             <td>\${fmtTok(r.output_tokens)}</td>
             <td class="hit">\${tokSaved?'-'+fmtTok(tokSaved):'—'} \${r.measured?'':'<span class="est">est</span>'}</td>
             <td>\${usd(r.real_cost_usd)}</td>
-            <td class="miss">\${usd(r.baseline_cost_usd)}</td>
-            <td class="hit">\${usd(saved)}</td>
+            <td class="\${savedCls}">\${usd(saved)}</td>
           </tr>\`;
         }).join('');
     }

@@ -39,6 +39,10 @@ const DEFAULTS: Config = {
   // Medição real via count_tokens (grátis, roda após a resposta).
   measure_savings: true,
 
+  // NÃO comprime clientes que já cacheiam (Claude Code) por padrão — evita
+  // furar o cache nativo e sair mais caro. Compressão fica para API crua.
+  compress_cached_clients: false,
+
   dashboard: { enabled: true, path: "/dashboard" },
 
   https_mode: { enabled: false, port: 443, hostname: "api.anthropic.com" },

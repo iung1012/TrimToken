@@ -24,8 +24,9 @@ function estimateTokens(text: string): number {
   return Math.ceil(text.length / 4);
 }
 
-/** Detecta se já existe cache_control em qualquer lugar da requisição. */
-function alreadyHasCacheControl(req: AnthropicRequest): boolean {
+/** Detecta se já existe cache_control em qualquer lugar da requisição.
+ *  (true = o cliente, ex. Claude Code, já gerencia o próprio prompt cache.) */
+export function hasCacheControl(req: AnthropicRequest): boolean {
   if (Array.isArray(req.system)) {
     if (req.system.some((b) => b && b.cache_control)) return true;
   }
@@ -40,7 +41,7 @@ function alreadyHasCacheControl(req: AnthropicRequest): boolean {
 export function injectPromptCache(request: AnthropicRequest, config: Config): AnthropicRequest {
   if (!config.prompt_cache.enabled) return request;
   // Cliente já gerencia o próprio cache — não interferir.
-  if (alreadyHasCacheControl(request)) return request;
+  if (hasCacheControl(request)) return request;
 
   const minTokens = config.prompt_cache.min_tokens_to_cache;
   const result: AnthropicRequest = { ...request };

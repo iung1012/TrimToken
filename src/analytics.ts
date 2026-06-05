@@ -75,23 +75,22 @@ export interface Summary {
   response_cache_hits: number;
 
   // Dinheiro (real)
-  real_cost_usd: number;        // o que você pagou
-  baseline_cost_usd: number;    // o que pagaria sem otimização nenhuma
-  total_savings_usd: number;    // baseline - real
-  compression_savings_usd: number;
-  cache_savings_usd: number;
-  response_cache_savings_usd: number;
-  savings_pct: number;
+  real_cost_usd: number;              // o que você pagou
+  trimtoken_savings_usd: number;      // economia ATRIBUÍVEL ao TrimToken (compressão + response cache + cache injetado por nós)
+  compression_savings_usd: number;    // parte de compressão (proxy)
+  response_cache_savings_usd: number; // parte de response cache (proxy)
+  native_cache_savings_usd: number;   // economia do cache NATIVO do cliente (info — não é mérito do proxy)
+  savings_pct: number;                // % economizado pelo TrimToken vs. sem TrimToken
 
   // Tokens (reais, processados pela API)
   input_tokens: number;
   output_tokens: number;
   cache_read_tokens: number;
   cache_creation_tokens: number;
-  original_input_tokens: number; // o que teria sido enviado sem compressão
-  input_tokens_saved: number;    // original - real enviado
+  original_input_tokens: number;
+  input_tokens_saved: number;
 
-  measured_pct: number;          // % das requisições com economia MEDIDA (count_tokens)
+  measured_pct: number;
   model_breakdown: Record<string, { requests: number; cost_usd: number }>;
 }
 
@@ -99,18 +98,17 @@ export function getSummary(days = 7): Summary {
   const since = Date.now() - days * 86_400_000;
   const rows = data.requests.filter((r) => r.timestamp >= since);
 
-  let real = 0, baseline = 0, compSav = 0, cacheSav = 0, respSav = 0, totalSav = 0;
+  let real = 0, compSav = 0, respSav = 0, proxySav = 0, nativeCacheSav = 0;
   let inTok = 0, outTok = 0, cacheRead = 0, cacheCreate = 0, origInTok = 0;
   let apiCalls = 0, respHits = 0, measuredCount = 0;
   const model_breakdown: Record<string, { requests: number; cost_usd: number }> = {};
 
   for (const r of rows) {
     real += r.real_cost_usd;
-    baseline += r.baseline_cost_usd;
     compSav += r.compression_savings_usd;
-    cacheSav += r.cache_savings_usd;
     respSav += r.response_cache_savings_usd;
-    totalSav += r.total_savings_usd + r.response_cache_savings_usd;
+    proxySav += r.total_savings_usd + r.response_cache_savings_usd; // atribuível ao TrimToken
+    if (r.client_cached) nativeCacheSav += r.cache_savings_usd;     // cache do próprio cliente (info)
 
     inTok += r.input_tokens;
     outTok += r.output_tokens;
@@ -127,7 +125,9 @@ export function getSummary(days = 7): Summary {
     model_breakdown[r.model] = mb;
   }
 
-  const savings_pct = baseline > 0 ? Math.max(0, Math.min(100, (totalSav / baseline) * 100)) : 0;
+  // baseline sem TrimToken = o que você pagaria de fato sem o proxy.
+  const withoutProxy = real + proxySav;
+  const savings_pct = withoutProxy > 0 ? Math.max(-100, Math.min(100, (proxySav / withoutProxy) * 100)) : 0;
   const realInputSent = inTok + cacheRead + cacheCreate;
 
   return {
@@ -135,11 +135,10 @@ export function getSummary(days = 7): Summary {
     api_calls: apiCalls,
     response_cache_hits: respHits,
     real_cost_usd: real,
-    baseline_cost_usd: baseline,
-    total_savings_usd: totalSav,
+    trimtoken_savings_usd: proxySav,
     compression_savings_usd: compSav,
-    cache_savings_usd: cacheSav,
     response_cache_savings_usd: respSav,
+    native_cache_savings_usd: nativeCacheSav,
     savings_pct,
     input_tokens: inTok,
     output_tokens: outTok,
